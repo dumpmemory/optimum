@@ -135,6 +135,7 @@ class ORTConfig(BaseConfig):
         calib_batch_size: Optional[int] = 8,
         seed: Optional[int] = 42,
         use_external_data_format: Optional[bool] = False,
+        op_types_to_quantize: Optional[List[str]] = None,
         nodes_to_quantize: Optional[List] = None,
         nodes_to_exclude: Optional[List] = None,
         extra_options: Optional[Dict[str, Any]] = None,
@@ -156,6 +157,7 @@ class ORTConfig(BaseConfig):
         self.calib_batch_size = calib_batch_size
         self.seed = seed
         self.use_external_data_format = use_external_data_format
+        self.op_types_to_quantize = op_types_to_quantize
         self.nodes_to_quantize = nodes_to_quantize
         self.nodes_to_exclude = nodes_to_exclude
         self.extra_options = extra_options

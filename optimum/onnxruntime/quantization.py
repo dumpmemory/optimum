@@ -227,7 +227,6 @@ class ORTQuantizer:
 
         q_model_path = generate_identified_filename(model_path, "-quantized")
         if self.quantization_approach == ORTQuantizationMode.DYNAMIC:
-            op_types_to_quantize = list(IntegerOpsRegistry.keys())
             quantize_dynamic(
                 model_path,
                 q_model_path,
@@ -236,14 +235,13 @@ class ORTQuantizer:
                 activation_type=self.activation_type,
                 weight_type=self.weight_type,
                 optimize_model=self.ort_config.optimize_model,
-                op_types_to_quantize=op_types_to_quantize,
+                op_types_to_quantize=self.ort_config.op_types_to_quantize,
                 use_external_data_format=self.ort_config.use_external_data_format,
             )
         elif self.quantization_approach == ORTQuantizationMode.STATIC:
             calib_dataset = self.calib_dataset if self.calib_dataset is not None else self.get_calib_dataset()
             calib_dataloader = self.get_calib_dataloader(calib_dataset)
             calib_data_reader = self.get_data_reader(calib_dataloader)
-            op_types_to_quantize = list(QLinearOpsRegistry.keys())
             quantize_static(
                 model_path,
                 q_model_path,
@@ -254,7 +252,7 @@ class ORTQuantizer:
                 activation_type=self.activation_type,
                 weight_type=self.weight_type,
                 optimize_model=self.ort_config.optimize_model,
-                op_types_to_quantize=op_types_to_quantize,
+                op_types_to_quantize=self.ort_config.op_types_to_quantize,
                 use_external_data_format=self.ort_config.use_external_data_format,
                 calibrate_method=self.calibrate_method,
                 nodes_to_quantize=self.ort_config.nodes_to_quantize,
