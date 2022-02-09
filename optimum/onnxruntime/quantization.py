@@ -19,16 +19,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional, Union
 
-import numpy
 import torch
 from datasets import Dataset, load_dataset
-from onnxruntime.quantization.registry import QLinearOpsRegistry, IntegerOpsRegistry
 from torch.utils.data import DataLoader, RandomSampler
 from transformers import AutoTokenizer, PretrainedConfig, default_data_collator
-from transformers.onnx import OnnxConfig, export
+from transformers.onnx import export
 from transformers.onnx.features import FeaturesManager
 
-import onnx
 from onnxruntime.quantization import (
     CalibrationDataReader,
     CalibrationMethod,
@@ -51,7 +48,7 @@ class ORTQuantizationMode(Enum):
 
 SUPPORTED_QUANT_MODE = set([approach.value for approach in ORTQuantizationMode])
 
-CALIB_METHOD = {"minmax": "MinMax", "entropy": "Entropy"}
+CALIB_METHOD = {"minmax": "MinMax", "entropy": "Entropy", "percentile": "Percentile"}
 
 Q_FORMAT = {"operator": "QOperator", "qdq": "QDQ"}
 
