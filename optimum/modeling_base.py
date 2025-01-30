@@ -17,18 +17,21 @@
 import logging
 import os
 import subprocess
+import warnings
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
 
-from huggingface_hub import HfApi, HfFolder
-from transformers import AutoConfig, add_start_docstrings
+from huggingface_hub import create_repo, upload_file
+from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+from transformers import AutoConfig, PretrainedConfig, add_start_docstrings
 
+from .exporters import TasksManager
 from .utils import CONFIG_NAME
 
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig, PreTrainedModel, TFPreTrainedModel
+    from transformers import PreTrainedModel, TFPreTrainedModel
 
 
 logger = logging.getLogger(__name__)
@@ -44,14 +47,16 @@ FROM_PRETRAINED_START_DOCSTRING = r"""
                     user or organization name, like `dbmdz/bert-base-german-cased`.
                 - A path to a *directory* containing a model saved using [`~OptimizedModel.save_pretrained`],
                     e.g., `./my_model_directory/`.
-        from_transformers (`bool`, defaults to `False`):
-            Defines whether the provided `model_id` contains a vanilla Transformers checkpoint.
+        export (`bool`, defaults to `False`):
+            Defines whether the provided `model_id` needs to be exported to the targeted format.
         force_download (`bool`, defaults to `True`):
             Whether or not to force the (re-)download of the model weights and configuration files, overriding the
             cached versions if they exist.
-        use_auth_token (`Optional[str]`, defaults to `None`):
+        use_auth_token (`Optional[Union[bool,str]]`, defaults to `None`):
+            Deprecated. Please use the `token` argument instead.
+        token (`Optional[Union[bool,str]]`, defaults to `None`):
             The token to use as HTTP bearer authorization for remote files. If `True`, will use the token generated
-            when running `transformers-cli login` (stored in `~/.huggingface`).
+            when running `huggingface-cli login` (stored in `huggingface_hub.constants.HF_TOKEN_PATH`).
         cache_dir (`Optional[str]`, defaults to `None`):
             Path to a directory in which a downloaded pretrained model configuration should be cached if the
             standard cache should not be used.
@@ -66,15 +71,24 @@ FROM_PRETRAINED_START_DOCSTRING = r"""
             Whether or not to allow for custom code defined on the Hub in their own modeling. This option should only be set
             to `True` for repositories you trust and in which you have read the code, as it will execute code present on
             the Hub on your local machine.
+        revision (`Optional[str]`, defaults to `None`):
+            The specific model version to use. It can be a branch name, a tag name, or a commit id, since we use a
+            git-based system for storing models and other artifacts on huggingface.co, so `revision` can be any
+            identifier allowed by git.
 """
 
 
-class OptimizedModel(ABC):
-    config_class = AutoConfig
-    load_tf_weights = None
-    base_model_prefix = "optimized_model"
+# workaround to enable compatibility between optimum models and transformers pipelines
+class PreTrainedModel(ABC):  # noqa: F811
+    pass
 
-    def __init__(self, model: Union["PreTrainedModel", "TFPreTrainedModel"], config: "PretrainedConfig"):
+
+class OptimizedModel(PreTrainedModel):
+    config_class = AutoConfig
+    base_model_prefix = "optimized_model"
+    config_name = CONFIG_NAME
+
+    def __init__(self, model: Union["PreTrainedModel", "TFPreTrainedModel"], config: PretrainedConfig):
         super().__init__()
         self.model = model
         self.config = config
@@ -120,7 +134,7 @@ class OptimizedModel(ABC):
 
         os.makedirs(save_directory, exist_ok=True)
 
-        self.config.save_pretrained(save_directory)
+        self._save_config(save_directory)
         for preprocessor in self.preprocessors:
             preprocessor.save_pretrained(save_directory)
         self._save_pretrained(save_directory)
@@ -136,40 +150,46 @@ class OptimizedModel(ABC):
         """
         raise NotImplementedError
 
+    def _save_config(self, save_directory):
+        """
+        Saves a model configuration into a directory, so that it can be re-loaded using the
+        [`from_pretrained`] class method.
+        """
+        self.config.save_pretrained(save_directory)
+
     def push_to_hub(
         self,
         save_directory: str,
         repository_id: str,
         private: Optional[bool] = None,
-        use_auth_token: Union[bool, str] = True,
+        use_auth_token: Optional[Union[bool, str]] = None,
+        token: Optional[Union[bool, str]] = None,
     ) -> str:
-        if isinstance(use_auth_token, str):
-            huggingface_token = use_auth_token
-        elif use_auth_token:
-            huggingface_token = HfFolder.get_token()
-        else:
-            raise ValueError("You need to proivde `use_auth_token` to be able to push to the hub")
-        api = HfApi()
+        if use_auth_token is not None:
+            warnings.warn(
+                "The `use_auth_token` argument is deprecated and will be removed soon. Please use the `token` argument instead.",
+                FutureWarning,
+            )
+            if token is not None:
+                raise ValueError("You cannot use both `use_auth_token` and `token` arguments at the same time.")
+            token = use_auth_token
 
-        user = api.whoami(huggingface_token)
-        self.git_config_username_and_email(git_email=user["email"], git_user=user["fullname"])
-
-        api.create_repo(
-            token=huggingface_token,
-            name=repository_id,
-            organization=user["name"],
+        create_repo(
+            token=token,
+            repo_id=repository_id,
             exist_ok=True,
             private=private,
         )
+
         for path, subdirs, files in os.walk(save_directory):
             for name in files:
                 local_file_path = os.path.join(path, name)
                 _, hub_file_path = os.path.split(local_file_path)
                 # FIXME: when huggingface_hub fixes the return of upload_file
                 try:
-                    api.upload_file(
-                        token=huggingface_token,
-                        repo_id=f"{user['name']}/{repository_id}",
+                    upload_file(
+                        token=token,
+                        repo_id=f"{repository_id}",
                         path_or_fileobj=os.path.join(os.getcwd(), local_file_path),
                         path_in_repo=hub_file_path,
                     )
@@ -207,19 +227,29 @@ class OptimizedModel(ABC):
         cls,
         config_name_or_path: Union[str, os.PathLike],
         revision: Optional[str] = None,
-        cache_dir: Optional[str] = None,
-        use_auth_token: Optional[Union[bool, str]] = False,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
+        use_auth_token: Optional[Union[bool, str]] = None,
+        token: Optional[Union[bool, str]] = None,
         force_download: bool = False,
         subfolder: str = "",
         trust_remote_code: bool = False,
-    ) -> "PretrainedConfig":
+    ) -> PretrainedConfig:
+        if use_auth_token is not None:
+            warnings.warn(
+                "The `use_auth_token` argument is deprecated and will be removed soon. Please use the `token` argument instead.",
+                FutureWarning,
+            )
+            if token is not None:
+                raise ValueError("You cannot use both `use_auth_token` and `token` arguments at the same time.")
+            token = use_auth_token
+
         try:
             config = AutoConfig.from_pretrained(
                 pretrained_model_name_or_path=config_name_or_path,
                 revision=revision,
                 cache_dir=cache_dir,
                 force_download=force_download,
-                use_auth_token=use_auth_token,
+                token=token,
                 subfolder=subfolder,
                 trust_remote_code=trust_remote_code,
             )
@@ -231,7 +261,7 @@ class OptimizedModel(ABC):
                     revision=revision,
                     cache_dir=cache_dir,
                     force_download=force_download,
-                    use_auth_token=use_auth_token,
+                    token=token,
                     trust_remote_code=trust_remote_code,
                 )
                 logger.info(
@@ -245,11 +275,12 @@ class OptimizedModel(ABC):
     def _from_pretrained(
         cls,
         model_id: Union[str, Path],
-        config: "PretrainedConfig",
+        config: PretrainedConfig,
         use_auth_token: Optional[Union[bool, str]] = None,
+        token: Optional[Union[bool, str]] = None,
         revision: Optional[str] = None,
         force_download: bool = False,
-        cache_dir: Optional[str] = None,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
         subfolder: str = "",
         local_files_only: bool = False,
         **kwargs,
@@ -261,11 +292,12 @@ class OptimizedModel(ABC):
     def _from_transformers(
         cls,
         model_id: Union[str, Path],
-        config: "PretrainedConfig",
+        config: PretrainedConfig,
         use_auth_token: Optional[Union[bool, str]] = None,
+        token: Optional[Union[bool, str]] = None,
         revision: Optional[str] = None,
         force_download: bool = False,
-        cache_dir: Optional[str] = None,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
         subfolder: str = "",
         local_files_only: bool = False,
         trust_remote_code: bool = False,
@@ -273,7 +305,28 @@ class OptimizedModel(ABC):
     ) -> "OptimizedModel":
         """Overwrite this method in subclass to define how to load your model from vanilla transformers model"""
         raise NotImplementedError(
-            "Overwrite this method in subclass to define how to load your model from vanilla transformers model"
+            "`_from_transformers` method will be deprecated in a future release. Please override `_export` instead"
+            "to define how to load your model from vanilla transformers model"
+        )
+
+    @classmethod
+    def _export(
+        cls,
+        model_id: Union[str, Path],
+        config: PretrainedConfig,
+        use_auth_token: Optional[Union[bool, str]] = None,
+        token: Optional[Union[bool, str]] = None,
+        revision: Optional[str] = None,
+        force_download: bool = False,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
+        subfolder: str = "",
+        local_files_only: bool = False,
+        trust_remote_code: bool = False,
+        **kwargs,
+    ) -> "OptimizedModel":
+        """Overwrite this method in subclass to define how to load your model from vanilla hugging face model"""
+        raise NotImplementedError(
+            "Overwrite this method in subclass to define how to load your model from vanilla hugging face model"
         )
 
     @classmethod
@@ -281,32 +334,81 @@ class OptimizedModel(ABC):
     def from_pretrained(
         cls,
         model_id: Union[str, Path],
-        from_transformers: bool = False,
+        export: bool = False,
         force_download: bool = False,
-        use_auth_token: Optional[str] = None,
-        cache_dir: Optional[str] = None,
+        use_auth_token: Optional[Union[bool, str]] = None,
+        token: Optional[Union[bool, str]] = None,
+        cache_dir: str = HUGGINGFACE_HUB_CACHE,
         subfolder: str = "",
-        config: Optional["PretrainedConfig"] = None,
+        config: Optional[PretrainedConfig] = None,
         local_files_only: bool = False,
         trust_remote_code: bool = False,
+        revision: Optional[str] = None,
         **kwargs,
     ) -> "OptimizedModel":
         """
         Returns:
             `OptimizedModel`: The loaded optimized model.
         """
-        revision = None
-        if len(str(model_id).split("@")) == 2:
+
+        if use_auth_token is not None:
+            warnings.warn(
+                "The `use_auth_token` argument is deprecated and will be removed soon. Please use the `token` argument instead.",
+                FutureWarning,
+            )
+            if token is not None:
+                raise ValueError("You cannot use both `use_auth_token` and `token` arguments at the same time.")
+            token = use_auth_token
+
+        if isinstance(model_id, Path):
+            model_id = model_id.as_posix()
+
+        from_transformers = kwargs.pop("from_transformers", None)
+        if from_transformers is not None:
+            logger.warning(
+                "The argument `from_transformers` is deprecated, and will be removed in optimum 2.0.  Use `export` instead"
+            )
+            export = from_transformers
+
+        if len(model_id.split("@")) == 2:
+            logger.warning(
+                f"Specifying the `revision` as @{model_id.split('@')[1]} is deprecated and will be removed in v1.23, please use the `revision` argument instead."
+            )
+            if revision is not None:
+                logger.warning(
+                    f"The argument `revision` was set to {revision} but will be ignored for {model_id.split('@')[1]}"
+                )
             model_id, revision = model_id.split("@")
 
+        all_files, _ = TasksManager.get_model_files(
+            model_id,
+            subfolder=subfolder,
+            cache_dir=cache_dir,
+            revision=revision,
+            token=token,
+        )
+
+        config_folder = subfolder
+        if cls.config_name not in all_files:
+            logger.info(
+                f"{cls.config_name} not found in the specified subfolder {subfolder}. Using the top level {cls.config_name}."
+            )
+            config_folder = ""
+
+        library_name = TasksManager.infer_library_from_model(
+            model_id, subfolder=config_folder, revision=revision, cache_dir=cache_dir, token=token
+        )
+
+        if library_name == "timm":
+            config = PretrainedConfig.from_pretrained(
+                model_id, subfolder=config_folder, revision=revision, cache_dir=cache_dir, token=token
+            )
+
         if config is None:
-            if os.path.isdir(os.path.join(model_id, subfolder)):
-                if CONFIG_NAME in os.listdir(os.path.join(model_id, subfolder)):
-                    config = AutoConfig.from_pretrained(os.path.join(model_id, subfolder, CONFIG_NAME))
-                elif CONFIG_NAME in os.listdir(model_id):
-                    config = AutoConfig.from_pretrained(os.path.join(model_id, CONFIG_NAME))
-                    logger.info(
-                        f"config.json not found in the specified subfolder {subfolder}. Using the top level config.json."
+            if os.path.isdir(os.path.join(model_id, config_folder)) and cls.config_name == CONFIG_NAME:
+                if CONFIG_NAME in os.listdir(os.path.join(model_id, config_folder)):
+                    config = AutoConfig.from_pretrained(
+                        os.path.join(model_id, config_folder), trust_remote_code=trust_remote_code
                     )
                 else:
                     raise OSError(f"config.json not found in {model_id} local folder")
@@ -315,35 +417,31 @@ class OptimizedModel(ABC):
                     model_id,
                     revision=revision,
                     cache_dir=cache_dir,
-                    use_auth_token=use_auth_token,
+                    token=token,
                     force_download=force_download,
-                    subfolder=subfolder,
+                    subfolder=config_folder,
+                    trust_remote_code=trust_remote_code,
                 )
         elif isinstance(config, (str, os.PathLike)):
             config = cls._load_config(
                 config,
                 revision=revision,
                 cache_dir=cache_dir,
-                use_auth_token=use_auth_token,
+                token=token,
                 force_download=force_download,
-                subfolder=subfolder,
+                subfolder=config_folder,
+                trust_remote_code=trust_remote_code,
             )
 
-        if not from_transformers and trust_remote_code is not False:
-            logger.warning(
-                "The argument `trust_remote_code` is to be used along with from_transformers=True. It will be ignored."
-            )
-        elif from_transformers and trust_remote_code is None:
-            trust_remote_code = False
+        from_pretrained_method = cls._from_transformers if export else cls._from_pretrained
 
-        from_pretrained_method = cls._from_transformers if from_transformers else cls._from_pretrained
         return from_pretrained_method(
             model_id=model_id,
             config=config,
             revision=revision,
             cache_dir=cache_dir,
             force_download=force_download,
-            use_auth_token=use_auth_token,
+            token=token,
             subfolder=subfolder,
             local_files_only=local_files_only,
             trust_remote_code=trust_remote_code,

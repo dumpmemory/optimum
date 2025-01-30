@@ -48,14 +48,15 @@ class TestOnnxConfigWithLoss(unittest.TestCase):
         model_checkpoint = "hf-internal-testing/tiny-random-bert"
         models = {
             AutoModelForSequenceClassification.from_pretrained(model_checkpoint),
-            TFAutoModelForSequenceClassification.from_pretrained(model_checkpoint),
         }
+        if is_tf_available():
+            models.add(TFAutoModelForSequenceClassification.from_pretrained(model_checkpoint))
 
         for model in models:
             with self.subTest(model=model):
                 with tempfile.TemporaryDirectory() as tmp_dir:
                     onnx_config_constructor = TasksManager.get_exporter_config_constructor(
-                        model=model, exporter="onnx", task="sequence-classification"
+                        model=model, exporter="onnx", task="text-classification"
                     )
                     onnx_config = onnx_config_constructor(model.config)
 
@@ -75,16 +76,18 @@ class TestOnnxConfigWithLoss(unittest.TestCase):
                     ort_sess = onnxruntime.InferenceSession(
                         onnx_model_path.as_posix(),
                         providers=[
-                            "CUDAExecutionProvider"
-                            if torch.cuda.is_available()
-                            and "CUDAExecutionProvider" in onnxruntime.get_available_providers()
-                            else "CPUExecutionProvider"
+                            (
+                                "CUDAExecutionProvider"
+                                if torch.cuda.is_available()
+                                and "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+                                else "CPUExecutionProvider"
+                            )
                         ],
                     )
                     framework = "pt" if isinstance(model, PreTrainedModel) else "tf"
                     normalized_config = NormalizedConfigManager.get_normalized_config_class("bert")(model.config)
                     input_generator = DummyTextInputGenerator(
-                        "sequence-classification", normalized_config, batch_size=2, sequence_length=16
+                        "text-classification", normalized_config, batch_size=2, sequence_length=16
                     )
 
                     inputs = {
@@ -98,9 +101,7 @@ class TestOnnxConfigWithLoss(unittest.TestCase):
                     input_names = [ort_input.name for ort_input in ort_sess._inputs_meta]
                     output_names = [output.name for output in ort_sess._outputs_meta]
 
-                    input_feed = dict(
-                        map(lambda input_name: (input_name, inputs[input_name].cpu().numpy()), input_names)
-                    )
+                    input_feed = {input_name: inputs[input_name].cpu().numpy() for input_name in input_names}
 
                     ort_outputs = ort_sess.run(output_names, input_feed)
                     pt_outputs = model(**inputs)
@@ -132,7 +133,7 @@ class TestOnnxConfigWithLoss(unittest.TestCase):
 
             # Wrap OnnxConfig
             onnx_config_constructor = TasksManager.get_exporter_config_constructor(
-                model=model, exporter="onnx", task="sequence-classification"
+                model=model, exporter="onnx", task="text-classification"
             )
             onnx_config = onnx_config_constructor(model.config)
             wrapped_onnx_config = OnnxConfigWithLoss(onnx_config)
@@ -146,9 +147,12 @@ class TestOnnxConfigWithLoss(unittest.TestCase):
             ort_sess = onnxruntime.InferenceSession(
                 onnx_model_path.as_posix(),
                 providers=[
-                    "CUDAExecutionProvider"
-                    if torch.cuda.is_available() and "CUDAExecutionProvider" in onnxruntime.get_available_providers()
-                    else "CPUExecutionProvider"
+                    (
+                        "CUDAExecutionProvider"
+                        if torch.cuda.is_available()
+                        and "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+                        else "CPUExecutionProvider"
+                    )
                 ],
             )
 
@@ -161,7 +165,7 @@ class TestOnnxConfigWithLoss(unittest.TestCase):
             }
             input_names = [ort_input.name for ort_input in ort_sess._inputs_meta]
             output_names = [output.name for output in ort_sess._outputs_meta]
-            input_feed = dict(map(lambda input_name: (input_name, inputs[input_name].cpu().numpy()), input_names))
+            input_feed = {input_name: inputs[input_name].cpu().numpy() for input_name in input_names}
             ort_outputs = ort_sess.run(output_names, input_feed)
             pt_outputs = model(**inputs)
 
@@ -183,7 +187,7 @@ class TestOnnxConfigWithLoss(unittest.TestCase):
 
             # Wrap OnnxConfig(decoders)
             onnx_config_constructor = TasksManager.get_exporter_config_constructor(
-                model=model, exporter="onnx", task="seq2seq-lm"
+                model=model, exporter="onnx", task="text2text-generation"
             )
             onnx_config = onnx_config_constructor(model.config)
 
@@ -207,9 +211,12 @@ class TestOnnxConfigWithLoss(unittest.TestCase):
             ort_sess = onnxruntime.InferenceSession(
                 onnx_model_path.as_posix(),
                 providers=[
-                    "CUDAExecutionProvider"
-                    if torch.cuda.is_available() and "CUDAExecutionProvider" in onnxruntime.get_available_providers()
-                    else "CPUExecutionProvider"
+                    (
+                        "CUDAExecutionProvider"
+                        if torch.cuda.is_available()
+                        and "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+                        else "CPUExecutionProvider"
+                    )
                 ],
             )
             batch = 3
@@ -223,7 +230,7 @@ class TestOnnxConfigWithLoss(unittest.TestCase):
             }
             input_names = [ort_input.name for ort_input in ort_sess._inputs_meta]
             output_names = [output.name for output in ort_sess._outputs_meta]
-            input_feed = dict(map(lambda input_name: (input_name, inputs[input_name].cpu().numpy()), input_names))
+            input_feed = {input_name: inputs[input_name].cpu().numpy() for input_name in input_names}
 
             ort_sess.run(output_names, input_feed)
 

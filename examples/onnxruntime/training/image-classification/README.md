@@ -11,9 +11,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# Language Modeling
-
-## Image Classification Training
+# Image Classification 
 
 By running the scripts [`run_image_classification.py`](https://github.com/huggingface/optimum/blob/main/examples/onnxruntime/training/image-classification/run_image_classification.py) we will be able to leverage the [`ONNX Runtime`](https://github.com/microsoft/onnxruntime) accelerator to train the language models from the
 [HuggingFace hub](https://huggingface.co/models).
@@ -27,11 +25,12 @@ __The following example applies the acceleration features powered by ONNX Runtim
 The following example trains ViT on beans dataset with mixed precision (fp16).
 
 ```bash
-python run_image_classification.py \
+torchrun --nproc_per_node=NUM_GPUS_YOU_HAVE run_image_classification.py \
     --model_name_or_path google/vit-base-patch16-224-in21k \
     --dataset_name beans \
     --output_dir ./beans_outputs/ \
     --remove_unused_columns False \
+    --label_column_name labels \
     --do_train \
     --do_eval \
     --learning_rate 2e-5 \
@@ -40,7 +39,7 @@ python run_image_classification.py \
     --per_device_eval_batch_size 32 \
     --logging_strategy steps \
     --logging_steps 10 \
-    --evaluation_strategy epoch \
+    --eval_strategy epoch \
     --seed 1337
 ```
 

@@ -14,19 +14,21 @@ logger = logging.get_logger()
 logging.set_verbosity_info()
 
 
-def timing_cuda(model, num_batches, input_ids, masks):
+def timing_cuda(model, num_batches, input_ids, masks, decoder_input_ids):
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     start_event.record()
     for _ in range(num_batches):
-        _ = model(input_ids, masks)
+        _ = model(input_ids, masks, decoder_input_ids=decoder_input_ids)
     end_event.record()
     torch.cuda.synchronize()
     return (start_event.elapsed_time(end_event) * 1.0e-3) / num_batches
 
 
 def benchmark(model_name: str, num_batches: int, batch_size: int, max_seqlen: int, is_half: bool):
-    hf_model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float16 if is_half else None).eval()
+    hf_model = AutoModel.from_pretrained(
+        model_name, torch_dtype=torch.float16 if is_half else None, attn_implementation="eager"
+    ).eval()
     hf_model = hf_model.to("cuda:0")
     bt_model = BetterTransformer.transform(hf_model, keep_original_model=True)
 
@@ -37,14 +39,16 @@ def benchmark(model_name: str, num_batches: int, batch_size: int, max_seqlen: in
     input_ids = input_ids.to("cuda:0")
     masks = masks.to("cuda:0")
 
+    decoder_input_ids = torch.ones(batch_size, 1, dtype=torch.int64).to("cuda:0")
+
     # Warmup
-    _ = hf_model(input_ids[0].unsqueeze(0), masks[0].unsqueeze(0))
+    _ = hf_model(input_ids, masks, decoder_input_ids=decoder_input_ids)
     torch.cuda.synchronize()
-    _ = bt_model(input_ids[0].unsqueeze(0), masks[0].unsqueeze(0))
+    _ = bt_model(input_ids, masks, decoder_input_ids=decoder_input_ids)
     torch.cuda.synchronize()
 
-    total_hf_time = timing_cuda(hf_model, num_batches, input_ids, masks)
-    total_bt_time = timing_cuda(bt_model, num_batches, input_ids, masks)
+    total_hf_time = timing_cuda(hf_model, num_batches, input_ids, masks, decoder_input_ids)
+    total_bt_time = timing_cuda(bt_model, num_batches, input_ids, masks, decoder_input_ids)
 
     return total_bt_time, total_hf_time
 
@@ -53,7 +57,6 @@ class TestSpeedup(unittest.TestCase):
     """
     TODO: test missing for:
 
-    - WhisperEncoderLayerBetterTransformer
     - ViTLayerBetterTransformer
     - ViltLayerBetterTransformer
     - Wav2Vec2EncoderLayerBetterTransformer

@@ -5,6 +5,11 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+    paths:
+      - "optimum/exporters/tasks.py"
+      - "optimum/exporters/tflite/**.py"
+      - "tests/exporters/**.py"
+      - "setup.py"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -15,10 +20,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [3.8, 3.9]
-        os: [ubuntu-20.04]
+        python-version: ['3.9', '3.11']
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-20.04
     steps:
     - uses: actions/checkout@v2
     - name: Setup Python ${{ matrix.python-version }}
@@ -31,4 +35,4 @@ jobs:
     - name: Test with unittest
       working-directory: tests
       run: |
-        pytest exporters/tflite/test_exporters_tflite_cli.py -s --durations=0
+        pytest exporters/tflite/test_exporters_tflite_cli.py -m "not quantization" -s --durations=0

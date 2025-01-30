@@ -13,17 +13,31 @@
 #  limitations under the License.
 """Utility functions, classes and constants for ONNX Runtime."""
 
-import importlib.util
+import importlib
 import os
+import re
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
+from inspect import signature
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
+from packaging import version
+from tqdm import tqdm
+from transformers import EvalPrediction
+from transformers.trainer_pt_utils import nested_concat
+from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import logging
 
 import onnxruntime as ort
 
 from ..exporters.onnx import OnnxConfig, OnnxConfigWithLoss
+
+
+if TYPE_CHECKING:
+    from datasets import Dataset
+
+    from .modeling_ort import ORTModel
 
 
 logger = logging.get_logger(__name__)
@@ -35,13 +49,30 @@ ONNX_DECODER_NAME = "decoder_model.onnx"
 ONNX_DECODER_WITH_PAST_NAME = "decoder_with_past_model.onnx"
 ONNX_DECODER_MERGED_NAME = "decoder_model_merged.onnx"
 
+_ORT_TO_NP_TYPE = {
+    "tensor(bool)": np.bool_,
+    "tensor(int8)": np.int8,
+    "tensor(uint8)": np.uint8,
+    "tensor(int16)": np.int16,
+    "tensor(uint16)": np.uint16,
+    "tensor(int32)": np.int32,
+    "tensor(uint32)": np.uint32,
+    "tensor(int64)": np.int64,
+    "tensor(uint64)": np.uint64,
+    "tensor(float16)": np.float16,
+    "tensor(float)": np.float32,
+    "tensor(double)": np.float64,
+}
+
 
 def _is_gpu_available():
     """
     Checks if a gpu is available.
     """
     available_providers = ort.get_available_providers()
-    if "CUDAExecutionProvider" in available_providers and torch.cuda.is_available():
+    if (
+        "CUDAExecutionProvider" in available_providers or "ROCMExecutionProvider" in available_providers
+    ) and torch.cuda.is_available():
         return True
     else:
         return False
@@ -60,8 +91,10 @@ def is_onnxruntime_training_available():
 
 def is_cupy_available():
     """
-    Checks if onnxruntime-training is available.
+    Checks if CuPy is available.
     """
+    # Don't use _is_package_available as it doesn't work with CuPy installed
+    # with `cupy-cuda*` and `cupy-rocm-*` package name (prebuilt wheels).
     return importlib.util.find_spec("cupy") is not None
 
 
@@ -75,12 +108,15 @@ class ORTConfigManager:
     """
 
     # Contribution note: Please add new models in alphabetical order
+    # TODO: for encoder-decoder models, validate if bert or gpt2 optimization is better
     _conf = {
         "albert": "bert",
         "bart": "bart",
         "bert": "bert",
-        "big_bird": "bert",
-        "bigbird_pegasus": None,  # bug in `fusion_skiplayernorm.py`
+        "big-bird": "bert",
+        "bigbird-pegasus": "bart",
+        "blenderbot": "bert",
+        "bloom": "gpt2",
         "camembert": "bert",
         "codegen": "gpt2",
         "deberta": "bert",
@@ -88,21 +124,33 @@ class ORTConfigManager:
         "distilbert": "bert",
         "electra": "bert",
         "gpt2": "gpt2",
-        "gpt_neo": "gpt2",
+        "gpt-bigcode": "gpt2",
+        "gpt-neo": "gpt2",
+        "gpt-neox": "gpt2",
+        "gptj": "gpt2",
+        "granite": "gpt2",
         "longt5": "bert",
+        "llama": "gpt2",
         "marian": "bart",
         "mbart": "bart",
+        "mistral": "gpt2",
+        "mpnet": "bert",
         "mt5": "bart",
-        "m2m_100": "bart",
+        "m2m-100": "bart",
         "nystromformer": "bert",
+        "pegasus": "bert",
         "roberta": "bert",
-        "t5": "t5",
-        "whisper": "whisper",
+        "segformer": "vit",
+        "t5": "bert",
+        "vit": "vit",
+        "whisper": "bart",
         "xlm-roberta": "bert",
+        "pix2struct": "vit",
     }
 
     @classmethod
     def get_model_ort_type(cls, model_type: str) -> str:
+        model_type = model_type.replace("_", "-")
         cls.check_supported_model(model_type)
         return cls._conf[model_type]
 
@@ -116,12 +164,26 @@ class ORTConfigManager:
             )
 
     @classmethod
-    def check_optimization_supported_model(cls, model_type: str):
-        supported_model_types_for_optimization = ["bert", "gpt2", "bart"]
+    def check_optimization_supported_model(cls, model_type: str, optimization_config):
+        # as of 1.15.O: https://github.com/microsoft/onnxruntime/blob/v1.15.0/onnxruntime/python/tools/transformers/optimizer.py#L42
+        supported_model_types_for_optimization = [
+            "bart",
+            "bert",
+            "gpt2",
+            "tnlr",
+            "t5",
+            "unet",
+            "vae",
+            "clip",
+            "vit",
+            "swin",
+            "swinv2",
+        ]
+        model_type = model_type.replace("_", "-")
         if (model_type not in cls._conf) or (cls._conf[model_type] not in supported_model_types_for_optimization):
-            raise KeyError(
-                f"ONNX Runtime doesn't support the graph optimization of {model_type} yet. Only {supported_model_types_for_optimization} are supported. "
-                f"If you want to support {model_type} please propose a PR or open up an issue in ONNX Runtime:https://github.com/microsoft/onnxruntime."
+            raise NotImplementedError(
+                f"ONNX Runtime doesn't support the graph optimization of {model_type} yet. Only {list(cls._conf.keys())} are supported. "
+                f"If you want to support {model_type} please propose a PR or open up an issue in ONNX Runtime: https://github.com/microsoft/onnxruntime."
             )
 
 
@@ -133,22 +195,26 @@ def wrap_onnx_config_for_loss(onnx_config: OnnxConfig) -> OnnxConfig:
     return OnnxConfigWithLoss(onnx_config)
 
 
-def get_device_for_provider(provider: str) -> torch.device:
+def get_device_for_provider(provider: str, provider_options: Dict) -> torch.device:
     """
     Gets the PyTorch device (CPU/CUDA) associated with an ONNX Runtime provider.
     """
-    return (
-        torch.device("cuda:0")
-        if provider in ["CUDAExecutionProvider", "TensorrtExecutionProvider"]
-        else torch.device("cpu")
-    )
+    if provider in ["CUDAExecutionProvider", "TensorrtExecutionProvider", "ROCMExecutionProvider"]:
+        return torch.device(f"cuda:{provider_options['device_id']}")
+    else:
+        return torch.device("cpu")
 
 
 def get_provider_for_device(device: torch.device) -> str:
     """
     Gets the ONNX Runtime provider associated with the PyTorch device (CPU/CUDA).
     """
-    return "CUDAExecutionProvider" if device.type.lower() == "cuda" else "CPUExecutionProvider"
+    if device.type.lower() == "cuda":
+        if "ROCMExecutionProvider" in ort.get_available_providers():
+            return "ROCMExecutionProvider"
+        else:
+            return "CUDAExecutionProvider"
+    return "CPUExecutionProvider"
 
 
 def parse_device(device: Union[torch.device, str, int]) -> Tuple[torch.device, Dict]:
@@ -176,8 +242,13 @@ def validate_provider_availability(provider: str):
     Args:
         provider (str): Name of an ONNX Runtime execution provider.
     """
-    # disable on Windows as reported in https://github.com/huggingface/optimum/issues/769
-    if os.name != "nt" and provider in ["CUDAExecutionProvider", "TensorrtExecutionProvider"]:
+    # Disable on Windows as reported in https://github.com/huggingface/optimum/issues/769.
+    # Disable as well for ORT 1.16.0 that has changed changed the way _ld_preload.py is filled: https://github.com/huggingface/optimum/issues/1402.
+    if (
+        version.parse(ort.__version__) < version.parse("1.16.0")
+        and os.name != "nt"
+        and provider in ["CUDAExecutionProvider", "TensorrtExecutionProvider"]
+    ):
         path_cuda_lib = os.path.join(ort.__path__[0], "capi", "libonnxruntime_providers_cuda.so")
         path_trt_lib = os.path.join(ort.__path__[0], "capi", "libonnxruntime_providers_tensorrt.so")
         path_dependecy_loading = os.path.join(ort.__path__[0], "capi", "_ld_preload.py")
@@ -222,16 +293,40 @@ def check_io_binding(providers: List[str], use_io_binding: Optional[bool] = None
     """
     Whether to use IOBinding or not.
     """
-    if providers[0] == "CUDAExecutionProvider" and use_io_binding is None:
+    if use_io_binding is None and providers[0] == "CUDAExecutionProvider":
         use_io_binding = True
-    elif providers[0] != "CUDAExecutionProvider":
+    elif providers[0] != "CPUExecutionProvider" and providers[0] != "CUDAExecutionProvider":
         if use_io_binding is True:
             logger.warning(
-                "No need to enable IO Binding if the provider used is not CUDAExecutionProvider. IO Binding will be turned off."
+                "No need to enable IO Binding if the provider used is neither CPUExecutionProvider nor CUDAExecutionProvider. IO Binding will be turned off."
             )
         use_io_binding = False
 
     return use_io_binding
+
+
+def get_ordered_input_names(input_names: List[str], func: Callable) -> List[str]:
+    """
+    Returns the input names from input_names keys ordered according to the signature of func. This is especially useful with the
+    forward function when using IO Binding, as the input order of the ONNX and forward may be different.
+
+    Method inspired from OnnxConfig.ordered_inputs.
+
+    Args:
+        input_names (`List[str]`):
+            Names of the inputs of the ONNX model.
+        func (`Callable`):
+            Callable to remap the input_names order to.
+
+    """
+    signature_func = signature(func)
+    _ordered_input_names = []
+    for param in signature_func.parameters:
+        param_regex = re.compile(rf"{param}(\.\d*)?")  # will for example match input_ids, past_key_values.0
+        for name in input_names:
+            if re.search(param_regex, name):
+                _ordered_input_names.append(name)
+    return _ordered_input_names
 
 
 class ORTQuantizableOperator(Enum):
@@ -259,3 +354,68 @@ class ORTQuantizableOperator(Enum):
     Resize = "Resize"
     AveragePool = "AveragePool"
     Concat = "Concat"
+
+
+def evaluation_loop(
+    model: "ORTModel",
+    dataset: "Dataset",
+    label_names: Optional[List[str]] = None,
+    compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None,
+):
+    """
+    Run evaluation and returns metrics and predictions.
+
+    Args:
+        model (`ORTModel`):
+            The ONNXRuntime model to use for the evaluation step.
+        dataset (`datasets.Dataset`):
+            Dataset to use for the evaluation step.
+        label_names (`List[str]`, `optional`):
+            The list of keys in your dictionary of inputs that correspond to the labels.
+        compute_metrics (`Callable[[EvalPrediction], Dict]`, `optional`):
+            The function that will be used to compute metrics at evaluation. Must take an `EvalPrediction` and
+            return a dictionary string to metric values.
+    """
+
+    all_preds = None
+    all_labels = None
+
+    for inputs in tqdm(dataset, desc="Evaluation"):
+        has_labels = all(inputs.get(k) is not None for k in label_names)
+        if has_labels:
+            labels = tuple(np.array([inputs.get(name)]) for name in label_names)
+            if len(labels) == 1:
+                labels = labels[0]
+        else:
+            labels = None
+
+        inputs = {key: np.array([inputs[key]]) for key in model.input_names if key in inputs}
+        preds = model(**inputs)
+
+        if len(preds) == 1:
+            preds = preds[0]
+
+        all_preds = preds if all_preds is None else nested_concat(all_preds, preds, padding_index=-100)
+        all_labels = labels if all_labels is None else nested_concat(all_labels, labels, padding_index=-100)
+
+    if compute_metrics is not None and all_preds is not None and all_labels is not None:
+        metrics = compute_metrics(EvalPrediction(predictions=all_preds, label_ids=all_labels))
+    else:
+        metrics = {}
+
+    return EvalLoopOutput(predictions=all_preds, label_ids=all_labels, metrics=metrics, num_samples=len(dataset))
+
+
+def np_to_pt_generators(np_object, device):
+    if isinstance(np_object, np.random.RandomState):
+        return torch.Generator(device=device).manual_seed(int(np_object.get_state()[1][0]))
+    elif isinstance(np_object, np.random.Generator):
+        return torch.Generator(device=device).manual_seed(int(np_object.bit_generator.state[1][0]))
+    elif isinstance(np_object, list) and isinstance(np_object[0], (np.random.RandomState, np.random.Generator)):
+        return [np_to_pt_generators(a, device) for a in np_object]
+    elif isinstance(np_object, dict) and isinstance(
+        next(iter(np_object.values())), (np.random.RandomState, np.random.Generator)
+    ):
+        return {k: np_to_pt_generators(v, device) for k, v in np_object.items()}
+    else:
+        return np_object

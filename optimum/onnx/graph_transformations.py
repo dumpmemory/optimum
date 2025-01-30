@@ -14,7 +14,7 @@
 import copy
 import os
 from pathlib import Path
-from typing import Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 import onnx
 from onnx import ModelProto
@@ -22,10 +22,13 @@ from onnx import ModelProto
 from ..utils import logging
 from .transformations_utils import (
     _create_name_sharing_dict,
+    _deduplicate_gather_matmul,
     _deduplicated_cross_model_initializers,
-    _find_duplicate_weights,
+    _find_duplicate_initializers,
+    _find_matching_initializers,
     _get_all_inputs,
     _get_onnx_opset,
+    _get_weights_to_tie,
     _remove_redundant_initializers,
     _replace_input_names,
     _unify_onnx_outputs,
@@ -33,16 +36,19 @@ from .transformations_utils import (
 )
 
 
+if TYPE_CHECKING:
+    import torch.nn as nn
+
+
 logger = logging.get_logger()
-
-
-ONNX_BYTE_SIZE_LIMIT = 2147483648
 
 
 def remove_duplicate_weights(model: ModelProto, inplace: bool = False) -> ModelProto:
     """
     Finds and removes duplicate weights in a model by keeping only unique weights, and make the duplicate values point
     to them.
+
+    This function only removes duplicate weights that are exactly identical (e.g., not transposed).
 
     Args:
         model (`onnx.ModelProto`): The model to remove duplicates from.
@@ -53,13 +59,47 @@ def remove_duplicate_weights(model: ModelProto, inplace: bool = False) -> ModelP
     """
     if not inplace:
         model = copy.deepcopy(model)
-    duplicates = _find_duplicate_weights(model)
+    duplicates = _find_duplicate_initializers(models=[model])
     name_sharing_dict = _create_name_sharing_dict(duplicates)
 
-    _replace_input_names(model, name_sharing_dict)
-    _remove_redundant_initializers(model, name_sharing_dict)
+    _replace_input_names(models=[model], name_sharing_dict=name_sharing_dict)
+    _remove_redundant_initializers(models=[model], name_sharing_dict=name_sharing_dict)
 
     return model
+
+
+def remove_duplicate_weights_from_tied_info(
+    onnx_model: ModelProto, torch_model: "nn.Module", tied_params: List[List[str]], save_path: str
+):
+    """
+    Tries to remove potential duplicate ONNX initializers from the tied information in tied_params.
+
+    Args:
+        onnx_model (`onnx.ModelProto`):
+            The ONNX model for which to tie potentially duplicate initializers.
+        torch_model (`nn.Module`):
+            The PyTorch model corresponding to the ONNX one.
+        tied_params (`List[List[str]]`):
+            A list of groups of torch parameters that are tied, i.e. shared. For them,
+            the torch module shares the same pointer.
+    """
+    tied_params_with_op, tied_groups_to_tie, tied_groups_ignored = _get_weights_to_tie(tied_params, torch_model)
+
+    if len(tied_groups_ignored) >= 1:
+        logger.info(
+            f"The groups of weights {tied_groups_ignored} will not be tied as either already tied or tying is not implemented."
+        )
+
+    initializer_name_to_idx = {}
+    for idx, initializer in enumerate(onnx_model.graph.initializer):
+        initializer_name_to_idx[initializer.name] = idx
+
+    tied_groups_map = _find_matching_initializers(tied_params_with_op, onnx_model, initializer_name_to_idx)
+
+    onnx_model = _deduplicate_gather_matmul(onnx_model, tied_groups_to_tie, tied_groups_map, initializer_name_to_idx)
+    check_and_save_model(onnx_model, save_path=save_path)
+
+    return onnx_model
 
 
 def replace_atenops_to_gather(model: ModelProto) -> ModelProto:
@@ -92,12 +132,75 @@ def replace_atenops_to_gather(model: ModelProto) -> ModelProto:
     return model
 
 
+def check_and_save_model(model: onnx.ModelProto, save_path: Optional[Union[str, Path]]):
+    # for large models, a path must be provided instead of a ModelProto:
+    # https://github.com/onnx/onnx/blob/main/docs/PythonAPIOverview.md#checking-a-large-onnx-model-2gb
+    if model.ByteSize() < onnx.checker.MAXIMUM_PROTOBUF:
+        # For the try catch, refer to https://github.com/microsoft/onnxruntime/issues/14768
+        try:
+            onnx.checker.check_model(model)
+        except Exception as e:
+            if "No Op registered for" in str(e):
+                pass
+            else:
+                raise e
+        if save_path:
+            # Overwrite.
+            save_path = Path(save_path).as_posix()
+            external_file_name = os.path.basename(save_path) + "_data"
+            # path/to/model.onnx_data
+            external_path = os.path.join(os.path.dirname(save_path), external_file_name)
+
+            if save_path.endswith(".onnx") and os.path.isfile(save_path):
+                os.remove(save_path)
+            if os.path.isfile(external_path):
+                # The new model may be below the maximum protobuf size, overwritting a model that was larger. Hence this os.remove.
+                os.remove(external_path)
+
+            onnx.save(
+                model,
+                save_path,
+                convert_attribute=True,
+            )
+    elif save_path is not None:
+        # path/to/model.onnx
+        save_path = Path(save_path).as_posix()
+
+        external_file_name = os.path.basename(save_path) + "_data"
+        # path/to/model.onnx_data
+        external_path = os.path.join(os.path.dirname(save_path), external_file_name)
+
+        if save_path.endswith(".onnx") and os.path.isfile(save_path):
+            os.remove(save_path)
+        if os.path.isfile(external_path):
+            os.remove(external_path)
+
+        onnx.save(
+            model,
+            save_path,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=external_file_name,
+            convert_attribute=True,
+        )
+        try:
+            onnx.checker.check_model(save_path)
+        except Exception as e:
+            if "No Op registered for" in str(e):
+                pass
+            else:
+                raise e
+    else:
+        logger.info("Merged ONNX model exceeds 2GB, the model will not be checked without `save_path` given.")
+
+
 def merge_decoders(
     decoder: Union[ModelProto, Path, str],
     decoder_with_past: Union[ModelProto, Path, str],
     graph_name: str = "merged",
     producer_name: str = "optimum-onnx",
     save_path: Optional[Union[str, Path]] = None,
+    strict: bool = True,
 ) -> ModelProto:
     """
     Fuses decoder ONNX model and decoder with past ONNX model into one ONNX model with if logic.
@@ -113,6 +216,10 @@ def merge_decoders(
             Graph producer name.
         save_path (`Optional[Union[str, Path]]`, defaults to `None`):
             The path to save merged ONNX model. The model will be saved if the path is given.
+        strict (`bool`, defaults to `True`):
+            When set, the decoder and decoder_with_past are expected to have strictly the same number of outputs. When False,
+            the decoder is allowed to have more outputs that decoder_with_past, in which case constant outputs are added to match
+            the number of outputs.
 
     Returns:
         `~onnx.ModelProto`: The fused decoder ONNX model.
@@ -132,12 +239,12 @@ def merge_decoders(
             f"Decoder's opset is {decoder_opset}, but decoder with past's opset is {decoder_with_past_opset}. Make sure having the same opset before merging."
         )
 
-    _unify_onnx_outputs(decoder, decoder_with_past)
+    _unify_onnx_outputs(decoder, decoder_with_past, strict=strict)
     all_inputs = _get_all_inputs([decoder, decoder_with_past])
 
     # Replace the axis name `sequence_length` of the attention_mask input by `attention_mask_sequence_length`.
     # This is because the merged model `input_ids` and `attention_mask` inputs may not always have the same length on the 2nd axis.
-    # In the first pass, `input_ids` and `attention_mask` are indeed of the same length, but in later path `input_ids` is of length 1
+    # In the first pass, `input_ids` and `attention_mask` are indeed of the same length, but in later pass `input_ids` is of length 1
     # while `attention_mask` is of length `past_sequence_length + 1`
     for _, inp in enumerate(all_inputs):
         if inp.name == "attention_mask":
@@ -147,20 +254,33 @@ def merge_decoders(
 
     deduplicated_initializers = _deduplicated_cross_model_initializers([decoder, decoder_with_past], suffix=graph_name)
 
+    # Keep initializers of dim 0 (or dim 1 + int32/int64) in subgraphs for readability purposes, and also because
+    # ONNX Runtime breaks after optimization + merge if they are not
+    decoder_initializers = []
+    for initializer in decoder.graph.initializer:
+        if len(initializer.dims) == 0 or (len(initializer.dims) == 1 and initializer.data_type in [6, 7]):
+            decoder_initializers.append(initializer)
+
+    decoder_with_past_initializers = []
+    for initializer in decoder_with_past.graph.initializer:
+        if len(initializer.dims) == 0 or (len(initializer.dims) == 1 and initializer.data_type in [6, 7]):
+            decoder_with_past_initializers.append(initializer)
+
     # Make subgraphs
     no_past_branch = onnx.helper.make_graph(
         nodes=decoder.graph.node,
         name="no_past",
         inputs=[],
         outputs=decoder.graph.output,
-        initializer=[],
+        initializer=decoder_initializers,
     )
+
     with_past_branch = onnx.helper.make_graph(
         nodes=decoder_with_past.graph.node,
         name="with_past",
         inputs=[],
         outputs=decoder_with_past.graph.output,
-        initializer=[],
+        initializer=decoder_with_past_initializers,
     )
 
     # Merge subgraphs with a `If` node
@@ -184,34 +304,21 @@ def merge_decoders(
         outputs=no_past_branch.output,
         initializer=deduplicated_initializers,
     )
-    merged_model = onnx.helper.make_model(
-        merged_graph,
-        producer_name=producer_name,
-        opset_imports=[
-            onnx.helper.make_opsetid(
-                domain=onnx.defs.ONNX_DOMAIN,
-                version=decoder_opset,
-            )
-        ],
+
+    # Preserve imports from the decoder without/with past ONNX
+    opset_imports = []
+    opset_domains = set()
+    for opset_import in list(decoder.opset_import) + list(decoder_with_past.opset_import):
+        if opset_import.domain not in opset_domains:
+            opset_imports.append(opset_import)
+            opset_domains.add(opset_import.domain)
+
+    # TODO: update IR version in the future.
+    merged_model = onnx.helper.make_model_gen_version(
+        merged_graph, producer_name=producer_name, opset_imports=opset_imports, ir_version=9
     )
 
-    if merged_model.ByteSize() < ONNX_BYTE_SIZE_LIMIT:
-        onnx.checker.check_model(merged_model)
-        if save_path:
-            save_path = Path(save_path).as_posix()
-            onnx.save(merged_model, save_path)
-    elif save_path is not None:
-        save_path = Path(save_path).as_posix()
-        onnx.save(
-            merged_model,
-            save_path,
-            save_as_external_data=True,
-            all_tensors_to_one_file=True,
-            location=os.path.basename(save_path) + "_data",
-        )
-        onnx.checker.check_model(save_path)
-    else:
-        logger.info("Merged ONNX model exceeds 2GB, the model will not be checked without `save_path` given.")
+    check_and_save_model(merged_model, save_path=save_path)
 
     return merged_model
 
