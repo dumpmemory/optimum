@@ -27,13 +27,13 @@ SEED = 42
 
 MODEL_NAMES = {
     "albert": "hf-internal-testing/tiny-random-AlbertModel",
-    "audio_spectrogram_transformer": "Ericwang/tiny-random-ast",
+    "audio-spectrogram-transformer": "Ericwang/tiny-random-ast",
     "beit": "hf-internal-testing/tiny-random-BeitForImageClassification",
     "bert": "hf-internal-testing/tiny-random-BertModel",
     "bart": "hf-internal-testing/tiny-random-bart",
     "big_bird": "hf-internal-testing/tiny-random-BigBirdModel",
     "bigbird_pegasus": "hf-internal-testing/tiny-random-BigBirdPegasusModel",
-    "blenderbot_small": "hf-internal-testing/tiny-random-BlenderbotModel",
+    "blenderbot-small": "hf-internal-testing/tiny-random-BlenderbotModel",
     "blenderbot": "hf-internal-testing/tiny-random-BlenderbotModel",
     "bloom": "hf-internal-testing/tiny-random-BloomModel",
     "camembert": "hf-internal-testing/tiny-random-camembert",
@@ -42,11 +42,11 @@ MODEL_NAMES = {
     "convnext": "hf-internal-testing/tiny-random-convnext",
     "convnextv2": "hf-internal-testing/tiny-random-ConvNextV2Model",
     "codegen": "hf-internal-testing/tiny-random-CodeGenForCausalLM",
-    "data2vec_text": "hf-internal-testing/tiny-random-Data2VecTextModel",
-    "data2vec_vision": "hf-internal-testing/tiny-random-Data2VecVisionModel",
-    "data2vec_audio": "hf-internal-testing/tiny-random-Data2VecAudioModel",
+    "data2vec-text": "hf-internal-testing/tiny-random-Data2VecTextModel",
+    "data2vec-vision": "hf-internal-testing/tiny-random-Data2VecVisionModel",
+    "data2vec-audio": "hf-internal-testing/tiny-random-Data2VecAudioModel",
     "deberta": "hf-internal-testing/tiny-random-DebertaModel",
-    "deberta_v2": "hf-internal-testing/tiny-random-DebertaV2Model",
+    "deberta-v2": "hf-internal-testing/tiny-random-DebertaV2Model",
     "deit": "hf-internal-testing/tiny-random-DeiTModel",
     "donut": "fxmarty/tiny-doc-qa-vision-encoder-decoder",
     "detr": "hf-internal-testing/tiny-random-detr",
@@ -73,6 +73,7 @@ MODEL_NAMES = {
     "hiera": "hf-internal-testing/tiny-random-HieraForImageClassification",
     "hubert": "hf-internal-testing/tiny-random-HubertModel",
     "ibert": "hf-internal-testing/tiny-random-IBertModel",
+    "internlm2": "optimum-internal-testing/tiny-random-internlm2",
     "latent-consistency": "echarlaix/tiny-random-latent-consistency",
     "layoutlm": "hf-internal-testing/tiny-random-LayoutLMModel",
     "layoutlmv3": "hf-internal-testing/tiny-random-LayoutLMv3Model",
@@ -112,7 +113,7 @@ MODEL_NAMES = {
     "roformer": "hf-internal-testing/tiny-random-RoFormerModel",
     "segformer": "hf-internal-testing/tiny-random-SegformerModel",
     "sew": "hf-internal-testing/tiny-random-SEWModel",
-    "sew_d": "asapp/sew-d-tiny-100k-ft-ls100h",
+    "sew-d": "asapp/sew-d-tiny-100k-ft-ls100h",
     "siglip": "hf-internal-testing/tiny-random-SiglipModel",
     "squeezebert": "hf-internal-testing/tiny-random-SqueezeBertModel",
     "speech_to_text": "optimum-internal-testing/tiny-random-Speech2TextModel",
@@ -127,7 +128,7 @@ MODEL_NAMES = {
     "table-transformer": "hf-internal-testing/tiny-random-TableTransformerModel",
     "trocr": "microsoft/trocr-small-handwritten",
     "unispeech": "hf-internal-testing/tiny-random-unispeech",
-    "unispeech_sat": "hf-internal-testing/tiny-random-UnispeechSatModel",
+    "unispeech-sat": "hf-internal-testing/tiny-random-UnispeechSatModel",
     "vision-encoder-decoder": "hf-internal-testing/tiny-random-VisionEncoderDecoderModel-vit-gpt2",
     "vit": "hf-internal-testing/tiny-random-vit",
     "whisper": "optimum-internal-testing/tiny-random-whisper",
@@ -135,8 +136,8 @@ MODEL_NAMES = {
     "wav2vec2-conformer": "hf-internal-testing/tiny-random-wav2vec2-conformer",
     "wavlm": "hf-internal-testing/tiny-random-WavlmModel",
     "xlm": "hf-internal-testing/tiny-random-XLMModel",
-    "xlm_qa": "hf-internal-testing/tiny-random-XLMForQuestionAnsweringSimple",
-    "xlm_roberta": "hf-internal-testing/tiny-xlm-roberta",
+    "xlm-qa": "hf-internal-testing/tiny-random-XLMForQuestionAnsweringSimple",
+    "xlm-roberta": "hf-internal-testing/tiny-xlm-roberta",
     "yolos": "hf-internal-testing/tiny-random-YolosModel",
 }
 
@@ -167,6 +168,7 @@ class ORTModelTestMixin(unittest.TestCase):
 
         model_arch_and_params = model_args.pop("test_name")
         model_arch = model_args.pop("model_arch")
+        trust_remote_code = model_args.pop("trust_remote_code", False)
 
         model_ids = MODEL_NAMES[model_arch]
         if isinstance(model_ids, dict):
@@ -189,7 +191,9 @@ class ORTModelTestMixin(unittest.TestCase):
 
             set_seed(SEED)
             model_dir = tempfile.mkdtemp(prefix=f"{model_arch_and_params}_{task}_{model_id.replace('/', '_')}")
-            onnx_model = self.ORTMODEL_CLASS.from_pretrained(model_id, **model_args, export=True)
+            onnx_model = self.ORTMODEL_CLASS.from_pretrained(
+                model_id, **model_args, export=True, trust_remote_code=trust_remote_code
+            )
             onnx_model.save_pretrained(model_dir)
 
             if isinstance(MODEL_NAMES[model_arch], dict):
